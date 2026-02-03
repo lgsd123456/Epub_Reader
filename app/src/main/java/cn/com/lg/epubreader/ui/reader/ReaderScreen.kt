@@ -1,6 +1,9 @@
 package cn.com.lg.epubreader.ui.reader
 
+import android.app.Activity
+import android.os.Build
 import android.os.SystemClock
+import android.view.WindowManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -20,6 +23,8 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -27,9 +32,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import cn.com.lg.epubreader.EpubReaderApp
 import cn.com.lg.epubreader.data.repository.BookRepository
 import cn.com.lg.epubreader.ui.theme.ThemeManager
@@ -46,6 +54,7 @@ fun ReaderScreen(
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
+    val view = LocalView.current
     val app = context.applicationContext as EpubReaderApp
     val repository = remember { BookRepository(app.database.bookDao()) }
     val viewModel = remember { ReaderViewModel(bookId, repository, context) }
@@ -63,6 +72,43 @@ fun ReaderScreen(
     // UI state for full screen
     var showUIBars by remember { mutableStateOf(true) }
     var showSettings by remember { mutableStateOf(false) }
+
+    DisposableEffect(Unit) {
+        val activity = context as? Activity
+        val window = activity?.window
+        if (window != null) {
+            val oldLayoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                window.attributes.layoutInDisplayCutoutMode
+            } else {
+                null
+            }
+
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val attrs = window.attributes
+                attrs.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                window.attributes = attrs
+            }
+            val controller = WindowCompat.getInsetsController(window, view)
+            controller.systemBarsBehavior =
+                androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+
+            onDispose {
+                val controller = WindowCompat.getInsetsController(window, view)
+                controller.show(WindowInsetsCompat.Type.systemBars())
+                WindowCompat.setDecorFitsSystemWindows(window, true)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && oldLayoutInDisplayCutoutMode != null) {
+                    val attrs = window.attributes
+                    attrs.layoutInDisplayCutoutMode = oldLayoutInDisplayCutoutMode
+                    window.attributes = attrs
+                }
+            }
+        } else {
+            onDispose {}
+        }
+    }
     
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -307,14 +353,15 @@ fun ReaderScreen(
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             Scaffold(
-                topBar = {
+                topBar = {},
+                bottomBar = {
                     if (showUIBars) {
-                        TopAppBar(
-                            title = {
-                                Text(book?.title ?: "Reading")
-                            },
-                            navigationIcon = {
-                                Row {
+                        BottomAppBar {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
                                     IconButton(onClick = onBack) {
                                         Icon(Icons.Default.ArrowBack, contentDescription = "Back")
                                     }
@@ -322,113 +369,113 @@ fun ReaderScreen(
                                         Icon(Icons.Default.Menu, contentDescription = "Menu")
                                     }
                                 }
-                            },
-                            actions = {
+
+                                Spacer(modifier = Modifier.weight(1f))
+
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton(onClick = { viewModel.prevChapter() }) {
+                                        Icon(Icons.Default.SkipPrevious, contentDescription = "Prev Chapter")
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            if (isTtsPlaying) {
+                                                viewModel.stopTts()
+                                                return@IconButton
+                                            }
+
+                                            val webView = webViewRef
+                                            if (webView == null) {
+                                                viewModel.startTtsAt(
+                                                    viewModel.currentChapterIndex.value,
+                                                    progress = 0f,
+                                                    autoContinue = true
+                                                )
+                                                return@IconButton
+                                            }
+
+                                            startDomTtsFromCurrentPosition(
+                                                webView = webView,
+                                                autoContinue = true,
+                                                fallback = {
+                                                    if (readingMode == ReaderViewModel.ReadingMode.CONTINUOUS_SCROLL) {
+                                                        webView.evaluateJavascript(
+                                                            "window.__epubReaderGetLocation && __epubReaderGetLocation();"
+                                                        ) { result ->
+                                                            val jsonText = normalizeEvaluateJavascriptResult(result)
+                                                            if (jsonText.isBlank() || jsonText == "null") {
+                                                                viewModel.startTtsAt(
+                                                                    viewModel.currentChapterIndex.value,
+                                                                    progress = 0f,
+                                                                    autoContinue = true
+                                                                )
+                                                                return@evaluateJavascript
+                                                            }
+                                                            runCatching {
+                                                                val obj = JSONObject(jsonText)
+                                                                val chapterIndex = obj.optInt("chapterIndex", viewModel.currentChapterIndex.value)
+                                                                val progress = obj.optDouble("progress", 0.0).toFloat()
+                                                                viewModel.startTtsAt(
+                                                                    chapterIndex,
+                                                                    progress = progress,
+                                                                    autoContinue = true
+                                                                )
+                                                            }.onFailure {
+                                                                viewModel.startTtsAt(
+                                                                    viewModel.currentChapterIndex.value,
+                                                                    progress = 0f,
+                                                                    autoContinue = true
+                                                                )
+                                                            }
+                                                        }
+                                                    } else {
+                                                        webView.evaluateJavascript(
+                                                            "(function(){ var h=Math.max(document.body.scrollHeight||0, document.documentElement.scrollHeight||0); var y=window.scrollY||0; var max=Math.max(1, h-window.innerHeight); return JSON.stringify({progress: y/max}); })();"
+                                                        ) { result ->
+                                                            val jsonText = normalizeEvaluateJavascriptResult(result)
+                                                            if (jsonText.isBlank() || jsonText == "null") {
+                                                                viewModel.startTtsAt(
+                                                                    viewModel.currentChapterIndex.value,
+                                                                    progress = 0f,
+                                                                    autoContinue = true
+                                                                )
+                                                                return@evaluateJavascript
+                                                            }
+                                                            runCatching {
+                                                                val obj = JSONObject(jsonText)
+                                                                val progress = obj.optDouble("progress", 0.0).toFloat()
+                                                                viewModel.startTtsAt(
+                                                                    viewModel.currentChapterIndex.value,
+                                                                    progress = progress,
+                                                                    autoContinue = true
+                                                                )
+                                                            }.onFailure {
+                                                                viewModel.startTtsAt(
+                                                                    viewModel.currentChapterIndex.value,
+                                                                    progress = 0f,
+                                                                    autoContinue = true
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    ) {
+                                        Icon(
+                                            if (isTtsPlaying) Icons.Default.Stop else Icons.Default.PlayArrow,
+                                            contentDescription = if (isTtsPlaying) "Stop" else "Play"
+                                        )
+                                    }
+                                    IconButton(onClick = { viewModel.nextChapter() }) {
+                                        Icon(Icons.Default.SkipNext, contentDescription = "Next Chapter")
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.weight(1f))
+
                                 IconButton(onClick = { showSettings = true }) {
                                     Icon(Icons.Default.Settings, contentDescription = "Settings")
                                 }
-                            }
-                        )
-                    }
-                },
-                bottomBar = {
-                    if (showUIBars) {
-                        BottomAppBar {
-                            IconButton(onClick = { viewModel.prevChapter() }) {
-                                Icon(Icons.Default.ArrowBack, contentDescription = "Prev")
-                            }
-                            IconButton(
-                                onClick = {
-                                    if (isTtsPlaying) {
-                                        viewModel.stopTts()
-                                        return@IconButton
-                                    }
-
-                                    val webView = webViewRef
-                                    if (webView == null) {
-                                        viewModel.startTtsAt(
-                                            viewModel.currentChapterIndex.value,
-                                            progress = 0f,
-                                            autoContinue = true
-                                        )
-                                        return@IconButton
-                                    }
-
-                                    startDomTtsFromCurrentPosition(
-                                        webView = webView,
-                                        autoContinue = true,
-                                        fallback = {
-                                            if (readingMode == ReaderViewModel.ReadingMode.CONTINUOUS_SCROLL) {
-                                                webView.evaluateJavascript(
-                                                    "window.__epubReaderGetLocation && __epubReaderGetLocation();"
-                                                ) { result ->
-                                                    val jsonText = normalizeEvaluateJavascriptResult(result)
-                                                    if (jsonText.isBlank() || jsonText == "null") {
-                                                        viewModel.startTtsAt(
-                                                            viewModel.currentChapterIndex.value,
-                                                            progress = 0f,
-                                                            autoContinue = true
-                                                        )
-                                                        return@evaluateJavascript
-                                                    }
-                                                    runCatching {
-                                                        val obj = JSONObject(jsonText)
-                                                        val chapterIndex = obj.optInt("chapterIndex", viewModel.currentChapterIndex.value)
-                                                        val progress = obj.optDouble("progress", 0.0).toFloat()
-                                                        viewModel.startTtsAt(
-                                                            chapterIndex,
-                                                            progress = progress,
-                                                            autoContinue = true
-                                                        )
-                                                    }.onFailure {
-                                                        viewModel.startTtsAt(
-                                                            viewModel.currentChapterIndex.value,
-                                                            progress = 0f,
-                                                            autoContinue = true
-                                                        )
-                                                    }
-                                                }
-                                            } else {
-                                                webView.evaluateJavascript(
-                                                    "(function(){ var h=Math.max(document.body.scrollHeight||0, document.documentElement.scrollHeight||0); var y=window.scrollY||0; var max=Math.max(1, h-window.innerHeight); return JSON.stringify({progress: y/max}); })();"
-                                                ) { result ->
-                                                    val jsonText = normalizeEvaluateJavascriptResult(result)
-                                                    if (jsonText.isBlank() || jsonText == "null") {
-                                                        viewModel.startTtsAt(
-                                                            viewModel.currentChapterIndex.value,
-                                                            progress = 0f,
-                                                            autoContinue = true
-                                                        )
-                                                        return@evaluateJavascript
-                                                    }
-                                                    runCatching {
-                                                        val obj = JSONObject(jsonText)
-                                                        val progress = obj.optDouble("progress", 0.0).toFloat()
-                                                        viewModel.startTtsAt(
-                                                            viewModel.currentChapterIndex.value,
-                                                            progress = progress,
-                                                            autoContinue = true
-                                                        )
-                                                    }.onFailure {
-                                                        viewModel.startTtsAt(
-                                                            viewModel.currentChapterIndex.value,
-                                                            progress = 0f,
-                                                            autoContinue = true
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    )
-                                }
-                            ) {
-                                Icon(
-                                    if (isTtsPlaying) Icons.Default.Stop else Icons.Default.PlayArrow,
-                                    contentDescription = if (isTtsPlaying) "Stop" else "Play"
-                                )
-                            }
-                            IconButton(onClick = { viewModel.nextChapter() }) {
-                                Icon(Icons.Default.ArrowForward, contentDescription = "Next")
                             }
                         }
                     }
